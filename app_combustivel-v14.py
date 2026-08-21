@@ -615,10 +615,13 @@ with tab_efet:
 
     # Table section below the charts as requested!
     st.markdown("#### 🗒️ Desempenho Físico por Veículo e Quinzena")
-    vehicle_fq_metrics = df_global.groupby(['PLACA', 'CATEGORIA', 'QUINZENA']).agg(
+    df_global_copy = df_global.copy()
+    df_global_copy['LITROS_SEM_ARLA'] = np.where(df_global_copy['TIPO COMBUSTIVEL'] != 'Arla 32', df_global_copy['LITROS'], 0.0)
+    
+    vehicle_fq_metrics = df_global_copy.groupby(['PLACA', 'CATEGORIA', 'QUINZENA']).agg(
         km_rodados=('KM RODADOS OU HORAS TRABALHADAS', 'sum'),
         hodometro_atual=('HODOMETRO OU HORIMETRO', 'max'),
-        litros=('LITROS', 'sum'),
+        litros=('LITROS_SEM_ARLA', 'sum'),
         gasto=('VALOR EMISSAO', 'sum')
     ).reset_index()
     
@@ -1097,14 +1100,17 @@ def generate_pdf_report(df_filtered, total_spend, total_liters, total_km, genera
     
     # 3. Fortnightly Summary
     story.append(Paragraph("<b>Custos e Volumes por Quinzena</b>", h1_style))
-    all_quinzenas_pdf = sorted(df_filtered['QUINZENA'].unique(), key=get_fortnight_sort_key)
-    fq_data = df_filtered.groupby('QUINZENA').agg(
+    df_filtered_copy = df_filtered.copy()
+    df_filtered_copy['LITROS_SEM_ARLA'] = np.where(df_filtered_copy['TIPO COMBUSTIVEL'] != 'Arla 32', df_filtered_copy['LITROS'], 0.0)
+    
+    all_quinzenas_pdf = sorted(df_filtered_copy['QUINZENA'].unique(), key=get_fortnight_sort_key)
+    fq_data = df_filtered_copy.groupby('QUINZENA').agg(
         gasto_total=('VALOR EMISSAO', 'sum'),
-        litros_totais=('LITROS', 'sum'),
+        litros_totais=('LITROS_SEM_ARLA', 'sum'),
         abastecimentos=('VALOR EMISSAO', 'count')
     ).reindex(all_quinzenas_pdf).reset_index()
     
-    diesel_fq_km = df_filtered[df_filtered['TIPO COMBUSTIVEL'] == 'DIESEL S-10 COMUM'].groupby('QUINZENA')['KM RODADOS OU HORAS TRABALHADAS'].sum().reindex(all_quinzenas_pdf)
+    diesel_fq_km = df_filtered_copy[df_filtered_copy['TIPO COMBUSTIVEL'] == 'DIESEL S-10 COMUM'].groupby('QUINZENA')['KM RODADOS OU HORAS TRABALHADAS'].sum().reindex(all_quinzenas_pdf)
     fq_data['km_rodados'] = fq_data['QUINZENA'].map(diesel_fq_km).fillna(0)
     fq_data['consumo_medio'] = np.where(fq_data['litros_totais'] > 0, fq_data['km_rodados'] / fq_data['litros_totais'], 0.0)
     
@@ -1195,13 +1201,14 @@ def generate_pdf_report(df_filtered, total_spend, total_liters, total_km, genera
     
     # 6. Driver Performance Summary
     story.append(Paragraph("<b>Performance e Custos por Motorista</b>", h1_style))
-    driver_summary = df_filtered.groupby('NOME MOTORISTA').agg(
+    # Using df_filtered_copy created in Fortnightly Summary which has LITROS_SEM_ARLA
+    driver_summary = df_filtered_copy.groupby('NOME MOTORISTA').agg(
         gasto_total=('VALOR EMISSAO', 'sum'),
-        litros_totais=('LITROS', 'sum'),
+        litros_totais=('LITROS_SEM_ARLA', 'sum'),
         abastecimentos=('VALOR EMISSAO', 'count')
     ).reset_index()
     
-    driver_km = df_filtered[df_filtered['TIPO COMBUSTIVEL'] == 'DIESEL S-10 COMUM'].groupby('NOME MOTORISTA')['KM RODADOS OU HORAS TRABALHADAS'].sum()
+    driver_km = df_filtered_copy[df_filtered_copy['TIPO COMBUSTIVEL'] == 'DIESEL S-10 COMUM'].groupby('NOME MOTORISTA')['KM RODADOS OU HORAS TRABALHADAS'].sum()
     driver_summary['km_rodados'] = driver_summary['NOME MOTORISTA'].map(driver_km).fillna(0)
     driver_summary['custo_km'] = np.where(driver_summary['km_rodados'] > 0, driver_summary['gasto_total'] / driver_summary['km_rodados'], 0.0)
     driver_summary['consumo_medio'] = np.where(driver_summary['litros_totais'] > 0, driver_summary['km_rodados'] / driver_summary['litros_totais'], 0.0)
