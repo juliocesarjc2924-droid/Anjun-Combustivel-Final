@@ -136,15 +136,8 @@ def get_fortnight_sort_key(name):
 def load_and_clean_data(file_path_or_buffer):
     import unicodedata
 
-    def strip_accents_and_strip(text):
-        if not isinstance(text, str):
-            return text
-        text = text.strip()
-        text = ''.join(c for c in unicodedata.normalize('NFD', text) if unicodedata.category(c) != 'Mn')
-        return text.upper()
-
+    # 1. Detect delimiter and encoding robustly
     try:
-        # Detect delimiter dynamically
         if isinstance(file_path_or_buffer, str):
             with open(file_path_or_buffer, 'r', encoding='utf-8', errors='ignore') as f:
                 first_line = f.readline()
@@ -153,13 +146,30 @@ def load_and_clean_data(file_path_or_buffer):
             file_path_or_buffer.seek(0)
         
         separator = ';' if ';' in first_line else ','
-        df = pd.read_csv(file_path_or_buffer, sep=separator)
+    except Exception as e:
+        st.error(f"Erro ao analisar o arquivo preliminarmente: {e}")
+        return None
+        
+    try:
+        # Load the dataframe with detected separator and fallback encoding
+        try:
+            df = pd.read_csv(file_path_or_buffer, sep=separator, encoding='utf-8')
+        except Exception:
+            if not isinstance(file_path_or_buffer, str):
+                file_path_or_buffer.seek(0)
+            df = pd.read_csv(file_path_or_buffer, sep=separator, encoding='latin1')
     except Exception as e:
         st.error(f"Erro ao ler o arquivo: {e}")
         return None
 
-    # Clean and standardise column names (stripping accents and spaces)
-    df.columns = [strip_accents_and_strip(c) for c in df.columns]
+    # Clean up column names (strip whitespace and remove accents)
+    def clean_col_name(col):
+        c_str = str(col).strip().upper()
+        return ''.join(
+            c for c in unicodedata.normalize('NFD', c_str)
+            if unicodedata.category(c) != 'Mn'
+        )
+    df.columns = [clean_col_name(c) for c in df.columns]
 
     # Helper to clean currency and numeric strings
     def clean_numeric(val):
@@ -177,18 +187,40 @@ def load_and_clean_data(file_path_or_buffer):
         'HODOMETRO OU HORIMETRO', 'KM RODADOS OU HORAS TRABALHADAS', 
         'KM/LITRO OU LITROS/HORA'
     ]
-    for col in numeric_cols:
-        if col in df.columns:
-            df[col] = df[col].apply(clean_numeric)
+    
+    # We clean numeric columns based on our mapping
+    for standard_col in numeric_cols:
+        col_accentless = clean_col_name(standard_col)
+        matched_col = None
+        for col in df.columns:
+            if col == col_accentless:
+                matched_col = col
+                break
+        if matched_col:
+            df[standard_col] = df[matched_col].apply(clean_numeric)
+            if matched_col != standard_col:
+                df.drop(columns=[matched_col], inplace=True, errors='ignore')
+
+    # Clean up dates with robust dayfirst parsing
+    date_col = 'DATA TRANSACAO'
+    date_col_accentless = clean_col_name(date_col)
+    matched_date_col = None
+    for col in df.columns:
+        if col == date_col_accentless:
+            matched_date_col = col
+            break
             
-    # Clean up dates dynamically (handles mixed formats, with/without seconds)
-    if 'DATA TRANSACAO' in df.columns:
-        df['DATA TRANSACAO'] = pd.to_datetime(df['DATA TRANSACAO'], format='mixed', dayfirst=True, errors='coerce')
+    if matched_date_col:
+        # Dayfirst is absolutely required for correct Brazilian parsing
+        df['DATA TRANSACAO'] = pd.to_datetime(df[matched_date_col], errors='coerce', dayfirst=True)
         df['DATA'] = df['DATA TRANSACAO'].dt.date
+        if matched_date_col != 'DATA TRANSACAO':
+            df.drop(columns=[matched_date_col], inplace=True, errors='ignore')
         
     # Standardize names
     if 'NOME MOTORISTA' in df.columns:
         df['NOME MOTORISTA'] = df['NOME MOTORISTA'].str.title()
+        
     if 'NOME ESTABELECIMENTO' in df.columns:
         df['NOME ESTABELECIMENTO'] = df['NOME ESTABELECIMENTO'].str.title()
     
@@ -211,8 +243,16 @@ def load_and_clean_data(file_path_or_buffer):
 
     df['QUINZENA'] = df.apply(get_fortnight, axis=1)
     
-    if 'MODELO VEICULO' in df.columns:
-        df['CATEGORIA'] = df['MODELO VEICULO'].map({'MASTER': 'Master', 'EXPRESS': 'Delivery'}).fillna('Outros')
+    # Map vehicle category
+    model_col = 'MODELO VEICULO'
+    model_col_accentless = clean_col_name(model_col)
+    matched_model_col = None
+    for col in df.columns:
+        if col == model_col_accentless:
+            matched_model_col = col
+            break
+    if matched_model_col:
+        df['CATEGORIA'] = df[matched_model_col].map({'MASTER': 'Master', 'EXPRESS': 'Delivery'}).fillna('Outros')
     else:
         df['CATEGORIA'] = 'Outros'
         
@@ -467,92 +507,65 @@ all_quinzenas = sorted(df_global['QUINZENA'].unique(), key=get_fortnight_sort_ke
 with tab_oper:
     st.subheader("📊 Relatório de Custos e Consumo Quinzenal")
     
-    # Aggregation of Spend, Liters and Diesel-Only Displacement (KM) by fortnight
-    df_diesel_only = df_global[df_global['TIPO COMBUSTIVEL'] == 'DIESEL S-10 COMUM']
-    diesel_fq_km = df_diesel_only.groupby('QUINZENA')['KM RODADOS OU HORAS TRABALHADAS'].sum()
-    
+    # Aggregation by fortnight (including kilometers)
     fq_summary = df_global.groupby('QUINZENA').agg(
-        gasto_total=('VALOR EMISSAO', 'sum'),
-        litros_totais=('LITROS', 'sum')
+        VALOR_EMISSAO=('VALOR EMISSAO', 'sum'),
+        LITROS=('LITROS', 'sum'),
+        KM_RODADOS=('KM RODADOS OU HORAS TRABALHADAS', 'sum')
     ).reindex(all_quinzenas).reset_index()
     
-    fq_summary['km_totais'] = fq_summary['QUINZENA'].map(diesel_fq_km).fillna(0.0)
-    
-    # Plotly Triple Y-Axis Chart (Bar for Spend, Line for Liters, Line for KM)
+    # Plotly Double Y-Axis Chart (Bar vs Line)
     fig_fq_dual = go.Figure()
     
-    # 1. Bar for spend (yaxis1 - left)
+    # Bar for spend (Valor Gasto) with white labels inside
     fig_fq_dual.add_trace(go.Bar(
         x=fq_summary['QUINZENA'],
-        y=fq_summary['gasto_total'],
+        y=fq_summary['VALOR_EMISSAO'],
         name="Valor Gasto (R$)",
         marker_color="#009a53", # Verde Anjun
-        text=fq_summary['gasto_total'].apply(lambda x: format_pt_br(x, 2, True)),
-        textposition="inside", # Rótulo de dados dentro da barra para contraste escuro
-        insidetextfont=dict(color="white", size=11, family="Inter"), # Letra branca sobre fundo verde escuro
+        text=fq_summary['VALOR_EMISSAO'].apply(lambda x: format_pt_br(x, 2, True)),
+        textposition="inside",
+        insidetextanchor="middle",
+        textfont=dict(color="white", size=11, family="Inter"),
         yaxis="y1"
     ))
     
-    # 2. Line for liters (yaxis2 - right)
+    # Line for liters (Volume) positioned above the points
     fig_fq_dual.add_trace(go.Scatter(
         x=fq_summary['QUINZENA'],
-        y=fq_summary['litros_totais'],
+        y=fq_summary['LITROS'],
         name="Volume Consumido (L)",
         mode="lines+markers+text",
         line=dict(color="#dc2626", width=4), # Vermelho Anjun
         marker=dict(size=10, color="#dc2626"),
-        text=fq_summary['litros_totais'].apply(lambda x: format_pt_br(x, 0) + " L"),
-        textposition="top center", # Rótulo acima do ponto para não sobrepor
+        text=fq_summary['LITROS'].apply(lambda x: format_pt_br(x, 0) + " L"),
+        textposition="top center",
         textfont=dict(color="#dc2626", size=11, family="Inter"),
         yaxis="y2"
     ))
     
-    # 3. Line for displacement (yaxis3 - right, shifted)
+    # Line for kilometers (Deslocamento) positioned below the points to prevent overlap
     fig_fq_dual.add_trace(go.Scatter(
         x=fq_summary['QUINZENA'],
-        y=fq_summary['km_totais'],
+        y=fq_summary['KM_RODADOS'],
         name="Deslocamento (km)",
         mode="lines+markers+text",
         line=dict(color="#f7cd23", width=4), # Amarelo Ouro ANJUN
         marker=dict(size=10, color="#f7cd23"),
-        text=fq_summary['km_totais'].apply(lambda x: format_pt_br(x, 0) + " km"),
-        textposition="bottom center", # Rótulo posicionado abaixo do ponto para não sobrepor
-        textfont=dict(color="#b45309", size=11, family="Inter"), # Tom escuro legível sobre fundo claro
-        yaxis="y3"
+        text=fq_summary['KM_RODADOS'].apply(lambda x: format_pt_br(x, 0) + " km"),
+        textposition="bottom center",
+        textfont=dict(color="#b45309", size=11, family="Inter"), # Legible dark gold/brown
+        yaxis="y2"
     ))
     
     fig_fq_dual.update_layout(
         title=dict(text="Custos, Volumes e Deslocamento por Quinzena", font=dict(size=15, color="#1e293b", family="Inter")),
         xaxis=dict(title="Quinzena"),
-        yaxis=dict(
-            title=dict(text="Valor Gasto (R$)", font=dict(color="#009a53")),
-            tickfont=dict(color="#009a53"),
-            tickprefix="R$ "
-        ),
-        yaxis2=dict(
-            title=dict(text="Volume (Litros)", font=dict(color="#dc2626")),
-            tickfont=dict(color="#dc2626"),
-            overlaying="y",
-            side="right"
-        ),
-        yaxis3=dict(
-            title=dict(text="Deslocamento (km)", font=dict(color="#b45309")),
-            tickfont=dict(color="#b45309"),
-            overlaying="y",
-            side="right",
-            anchor="free",
-            position=1.12 # Posicionamento limpo à direita do eixo de volume
-        ),
-        legend=dict(
-            orientation="h",
-            yanchor="bottom",
-            y=1.02,
-            xanchor="right",
-            x=1,
-            bgcolor="rgba(255, 255, 255, 0.8)"
-        ),
-        margin=dict(l=60, r=80, t=80, b=40), # Margens limpas para abrigar o terceiro eixo
-        height=480,
+        yaxis=dict(title=dict(text="Valor Gasto (R$)", font=dict(color="#009a53")), tickfont=dict(color="#009a53"), tickprefix="R$ "),
+        yaxis2=dict(title=dict(text="Volume (L) / Deslocamento (km)", font=dict(color="#1e293b")), tickfont=dict(color="#1e293b"), overlaying="y", side="right"),
+        legend=dict(x=0.01, y=0.99, bgcolor="rgba(255, 255, 255, 0.8)"),
+        margin=dict(l=40, r=40, t=50, b=40),
+        height=450,
         plot_bgcolor="#ffffff",
         paper_bgcolor="#ffffff"
     )
