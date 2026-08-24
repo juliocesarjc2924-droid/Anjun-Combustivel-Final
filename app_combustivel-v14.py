@@ -134,11 +134,41 @@ def get_fortnight_sort_key(name):
 # --- DATA LOADING ---
 @st.cache_data
 def load_and_clean_data(file_path_or_buffer):
+    import unicodedata
+    
+    # 1. Detect delimiter and encoding robustly
     try:
-        df = pd.read_csv(file_path_or_buffer, sep=';')
+        if isinstance(file_path_or_buffer, str):
+            with open(file_path_or_buffer, 'r', encoding='utf-8', errors='ignore') as f:
+                first_line = f.readline()
+        else:
+            first_line = file_path_or_buffer.getvalue().decode('utf-8', errors='ignore').split('\n')[0]
+            file_path_or_buffer.seek(0)
+        
+        separator = ';' if ';' in first_line else ','
     except Exception as e:
-        st.error(f"Erro ao ler o arquivo: {e}")
+        st.error(f"Erro ao analisar o arquivo preliminarmente: {e}")
         return None
+        
+    try:
+        try:
+            df = pd.read_csv(file_path_or_buffer, sep=separator, encoding='utf-8')
+        except UnicodeDecodeError:
+            if not isinstance(file_path_or_buffer, str):
+                file_path_or_buffer.seek(0)
+            df = pd.read_csv(file_path_or_buffer, sep=separator, encoding='latin-1')
+    except Exception as e:
+        st.error(f"Erro ao ler o arquivo CSV: {e}")
+        return None
+
+    # 2. Normalize and clean column headers (remove accents and trailing spaces)
+    def normalize_header(s):
+        if not isinstance(s, str):
+            return s
+        s_clean = ''.join(c for c in unicodedata.normalize('NFKD', s) if not unicodedata.combining(c))
+        return s_clean.strip().upper()
+
+    df.columns = [normalize_header(col) for col in df.columns]
 
     # Helper to clean currency and numeric strings
     def clean_numeric(val):
@@ -160,14 +190,18 @@ def load_and_clean_data(file_path_or_buffer):
         if col in df.columns:
             df[col] = df[col].apply(clean_numeric)
             
-    # Clean up dates
+    # Clean up dates using 'mixed' format parser (extremely robust)
     if 'DATA TRANSACAO' in df.columns:
-        df['DATA TRANSACAO'] = pd.to_datetime(df['DATA TRANSACAO'], format='%d/%m/%Y %H:%M:%S', errors='coerce')
+        df['DATA TRANSACAO'] = pd.to_datetime(df['DATA TRANSACAO'], format='mixed', dayfirst=True, errors='coerce')
+        # Drop rows with invalid or missing date transacao (such as blank excel export rows)
+        df = df.dropna(subset=['DATA TRANSACAO'])
         df['DATA'] = df['DATA TRANSACAO'].dt.date
         
     # Standardize names
-    df['NOME MOTORISTA'] = df['NOME MOTORISTA'].str.title()
-    df['NOME ESTABELECIMENTO'] = df['NOME ESTABELECIMENTO'].str.title()
+    if 'NOME MOTORISTA' in df.columns:
+        df['NOME MOTORISTA'] = df['NOME MOTORISTA'].str.title()
+    if 'NOME ESTABELECIMENTO' in df.columns:
+        df['NOME ESTABELECIMENTO'] = df['NOME ESTABELECIMENTO'].str.title()
     
     # Fortnight (Quinzena) Definition
     def get_fortnight(row):
@@ -187,8 +221,16 @@ def load_and_clean_data(file_path_or_buffer):
         return f"{half} {m_name}/{year_short}"
 
     df['QUINZENA'] = df.apply(get_fortnight, axis=1)
-    df['CATEGORIA'] = df['MODELO VEICULO'].map({'MASTER': 'Master', 'EXPRESS': 'Delivery'}).fillna('Outros')
-    df['CUSTO_KM'] = np.where(df['KM RODADOS OU HORAS TRABALHADAS'] > 0, df['VALOR EMISSAO'] / df['KM RODADOS OU HORAS TRABALHADAS'], 0.0)
+    
+    if 'MODELO VEICULO' in df.columns:
+        df['CATEGORIA'] = df['MODELO VEICULO'].map({'MASTER': 'Master', 'EXPRESS': 'Delivery'}).fillna('Outros')
+    else:
+        df['CATEGORIA'] = 'Outros'
+        
+    if 'KM RODADOS OU HORAS TRABALHADAS' in df.columns and 'VALOR EMISSAO' in df.columns:
+        df['CUSTO_KM'] = np.where(df['KM RODADOS OU HORAS TRABALHADAS'] > 0, df['VALOR EMISSAO'] / df['KM RODADOS OU HORAS TRABALHADAS'], 0.0)
+    else:
+        df['CUSTO_KM'] = 0.0
     
     return df
 
@@ -440,29 +482,18 @@ with tab_oper:
     st.subheader("📊 Relatório de Custos e Consumo Quinzenal")
     
     # Aggregation by fortnight
-    fq_summary = df_global.groupby('QUINZENA')[['VALOR EMISSAO', 'LITROS', 'KM RODADOS OU HORAS TRABALHADAS']].sum().reindex(all_quinzenas).reset_index()
+    fq_summary = df_global.groupby('QUINZENA')[['VALOR EMISSAO', 'LITROS']].sum().reindex(all_quinzenas).reset_index()
     
-    # Plotly Double Y-Axis Chart (Grouped Bars vs Line)
+    # Plotly Double Y-Axis Chart (Bar vs Line)
     fig_fq_dual = go.Figure()
     
-    # Bar for spend (R$)
+    # Bar for spend
     fig_fq_dual.add_trace(go.Bar(
         x=fq_summary['QUINZENA'],
         y=fq_summary['VALOR EMISSAO'],
         name="Valor Gasto (R$)",
         marker_color="#009a53", # Verde Anjun
         text=fq_summary['VALOR EMISSAO'].apply(lambda x: format_pt_br(x, 2, True)),
-        textposition="auto",
-        yaxis="y1"
-    ))
-    
-    # Bar for displacement (KM)
-    fig_fq_dual.add_trace(go.Bar(
-        x=fq_summary['QUINZENA'],
-        y=fq_summary['KM RODADOS OU HORAS TRABALHADAS'],
-        name="Deslocamento (km)",
-        marker_color="#f7cd23", # Amarelo Ouro
-        text=fq_summary['KM RODADOS OU HORAS TRABALHADAS'].apply(lambda x: format_pt_br(x, 0) + " km"),
         textposition="auto",
         yaxis="y1"
     ))
@@ -481,16 +512,15 @@ with tab_oper:
     ))
     
     fig_fq_dual.update_layout(
-        title=dict(text="Custos, Volumes e Deslocamento por Quinzena (Clique para Filtrar)", font=dict(size=15, color="#1e293b", family="Inter")),
+        title=dict(text="Custos e Volumes por Quinzena", font=dict(size=15, color="#1e293b", family="Inter")),
         xaxis=dict(title="Quinzena"),
-        yaxis=dict(title=dict(text="Valores Operacionais (R$ ou km)", font=dict(color="#1e293b")), tickfont=dict(color="#1e293b")),
+        yaxis=dict(title=dict(text="Valor Gasto", font=dict(color="#009a53")), tickfont=dict(color="#009a53"), tickprefix="R$ "),
         yaxis2=dict(title=dict(text="Volume (Litros)", font=dict(color="#dc2626")), tickfont=dict(color="#dc2626"), overlaying="y", side="right"),
         legend=dict(x=0.01, y=0.99, bgcolor="rgba(255, 255, 255, 0.8)"),
         margin=dict(l=40, r=40, t=50, b=40),
         height=450,
         plot_bgcolor="#ffffff",
-        paper_bgcolor="#ffffff",
-        barmode="group"
+        paper_bgcolor="#ffffff"
     )
     
     selected_fq = st.plotly_chart(fig_fq_dual, use_container_width=True, on_select="rerun", key="fq_chart_select")
