@@ -220,28 +220,22 @@ else:
 st.sidebar.markdown("</div>", unsafe_allow_html=True)
 
 # --- LOADING THE DATASET ---
+uploaded_file = st.sidebar.file_uploader("📥 Enviar planilha (.csv)", type=["csv"])
+
 df_raw = None
-default_paths = [
-    'Historico_de_abastecimento.csv',
-    'Historico de abastecimento.csv',
-    '/workspace/knowledge/Historico_de_abastecimento.csv',
-    '/workspace/knowledge/Historico de abastecimento.csv'
-]
-for p in default_paths:
-    if os.path.exists(p):
-        df_raw = load_and_clean_data(p)
-        break
-        
+if uploaded_file is not None:
+    df_raw = load_and_clean_data(uploaded_file)
+    st.sidebar.success("Planilha carregada!")
+else:
+    default_paths = ['Historico_de_abastecimento.csv', '/workspace/knowledge/Historico_de_abastecimento.csv']
+    for p in default_paths:
+        if os.path.exists(p):
+            df_raw = load_and_clean_data(p)
+            break
+            
 if df_raw is None:
-    # Solução híbrida e segura: se o arquivo não estiver no GitHub, mostramos o uploader
-    # para evitar que o Streamlit Cloud caia com erro de acesso ou tela de parada abrupta.
-    uploaded_file = st.sidebar.file_uploader("📥 Enviar planilha (.csv)", type=["csv"])
-    if uploaded_file is not None:
-        df_raw = load_and_clean_data(uploaded_file)
-        st.sidebar.success("Planilha carregada!")
-    else:
-        st.sidebar.warning("⚠️ Para ativar o modo automático, envie o arquivo 'Historico de abastecimento.csv' para o seu GitHub.")
-        st.stop()
+    st.sidebar.warning("⚠️ Envie o arquivo de histórico de abastecimento.")
+    st.stop()
 
 # --- SIDEBAR ADVANCED FILTERS (STRICTLY THE 5 SPECIFIED BY USER) ---
 st.sidebar.markdown("### 🔍 Filtros de Análise")
@@ -446,18 +440,29 @@ with tab_oper:
     st.subheader("📊 Relatório de Custos e Consumo Quinzenal")
     
     # Aggregation by fortnight
-    fq_summary = df_global.groupby('QUINZENA')[['VALOR EMISSAO', 'LITROS']].sum().reindex(all_quinzenas).reset_index()
+    fq_summary = df_global.groupby('QUINZENA')[['VALOR EMISSAO', 'LITROS', 'KM RODADOS OU HORAS TRABALHADAS']].sum().reindex(all_quinzenas).reset_index()
     
-    # Plotly Double Y-Axis Chart (Bar vs Line)
+    # Plotly Double Y-Axis Chart (Grouped Bars vs Line)
     fig_fq_dual = go.Figure()
     
-    # Bar for spend
+    # Bar for spend (R$)
     fig_fq_dual.add_trace(go.Bar(
         x=fq_summary['QUINZENA'],
         y=fq_summary['VALOR EMISSAO'],
         name="Valor Gasto (R$)",
         marker_color="#009a53", # Verde Anjun
         text=fq_summary['VALOR EMISSAO'].apply(lambda x: format_pt_br(x, 2, True)),
+        textposition="auto",
+        yaxis="y1"
+    ))
+    
+    # Bar for displacement (KM)
+    fig_fq_dual.add_trace(go.Bar(
+        x=fq_summary['QUINZENA'],
+        y=fq_summary['KM RODADOS OU HORAS TRABALHADAS'],
+        name="Deslocamento (km)",
+        marker_color="#f7cd23", # Amarelo Ouro
+        text=fq_summary['KM RODADOS OU HORAS TRABALHADAS'].apply(lambda x: format_pt_br(x, 0) + " km"),
         textposition="auto",
         yaxis="y1"
     ))
@@ -476,15 +481,16 @@ with tab_oper:
     ))
     
     fig_fq_dual.update_layout(
-        title=dict(text="Custos e Volumes por Quinzena", font=dict(size=15, color="#1e293b", family="Inter")),
+        title=dict(text="Custos, Volumes e Deslocamento por Quinzena (Clique para Filtrar)", font=dict(size=15, color="#1e293b", family="Inter")),
         xaxis=dict(title="Quinzena"),
-        yaxis=dict(title=dict(text="Valor Gasto", font=dict(color="#009a53")), tickfont=dict(color="#009a53"), tickprefix="R$ "),
+        yaxis=dict(title=dict(text="Valores Operacionais (R$ ou km)", font=dict(color="#1e293b")), tickfont=dict(color="#1e293b")),
         yaxis2=dict(title=dict(text="Volume (Litros)", font=dict(color="#dc2626")), tickfont=dict(color="#dc2626"), overlaying="y", side="right"),
         legend=dict(x=0.01, y=0.99, bgcolor="rgba(255, 255, 255, 0.8)"),
         margin=dict(l=40, r=40, t=50, b=40),
         height=450,
         plot_bgcolor="#ffffff",
-        paper_bgcolor="#ffffff"
+        paper_bgcolor="#ffffff",
+        barmode="group"
     )
     
     selected_fq = st.plotly_chart(fig_fq_dual, use_container_width=True, on_select="rerun", key="fq_chart_select")
@@ -615,13 +621,10 @@ with tab_efet:
 
     # Table section below the charts as requested!
     st.markdown("#### 🗒️ Desempenho Físico por Veículo e Quinzena")
-    df_global_copy = df_global.copy()
-    df_global_copy['LITROS_SEM_ARLA'] = np.where(df_global_copy['TIPO COMBUSTIVEL'] != 'Arla 32', df_global_copy['LITROS'], 0.0)
-    
-    vehicle_fq_metrics = df_global_copy.groupby(['PLACA', 'CATEGORIA', 'QUINZENA']).agg(
+    vehicle_fq_metrics = df_global.groupby(['PLACA', 'CATEGORIA', 'QUINZENA']).agg(
         km_rodados=('KM RODADOS OU HORAS TRABALHADAS', 'sum'),
         hodometro_atual=('HODOMETRO OU HORIMETRO', 'max'),
-        litros=('LITROS_SEM_ARLA', 'sum'),
+        litros=('LITROS', 'sum'),
         gasto=('VALOR EMISSAO', 'sum')
     ).reset_index()
     
@@ -1100,17 +1103,14 @@ def generate_pdf_report(df_filtered, total_spend, total_liters, total_km, genera
     
     # 3. Fortnightly Summary
     story.append(Paragraph("<b>Custos e Volumes por Quinzena</b>", h1_style))
-    df_filtered_copy = df_filtered.copy()
-    df_filtered_copy['LITROS_SEM_ARLA'] = np.where(df_filtered_copy['TIPO COMBUSTIVEL'] != 'Arla 32', df_filtered_copy['LITROS'], 0.0)
-    
-    all_quinzenas_pdf = sorted(df_filtered_copy['QUINZENA'].unique(), key=get_fortnight_sort_key)
-    fq_data = df_filtered_copy.groupby('QUINZENA').agg(
+    all_quinzenas_pdf = sorted(df_filtered['QUINZENA'].unique(), key=get_fortnight_sort_key)
+    fq_data = df_filtered.groupby('QUINZENA').agg(
         gasto_total=('VALOR EMISSAO', 'sum'),
-        litros_totais=('LITROS_SEM_ARLA', 'sum'),
+        litros_totais=('LITROS', 'sum'),
         abastecimentos=('VALOR EMISSAO', 'count')
     ).reindex(all_quinzenas_pdf).reset_index()
     
-    diesel_fq_km = df_filtered_copy[df_filtered_copy['TIPO COMBUSTIVEL'] == 'DIESEL S-10 COMUM'].groupby('QUINZENA')['KM RODADOS OU HORAS TRABALHADAS'].sum().reindex(all_quinzenas_pdf)
+    diesel_fq_km = df_filtered[df_filtered['TIPO COMBUSTIVEL'] == 'DIESEL S-10 COMUM'].groupby('QUINZENA')['KM RODADOS OU HORAS TRABALHADAS'].sum().reindex(all_quinzenas_pdf)
     fq_data['km_rodados'] = fq_data['QUINZENA'].map(diesel_fq_km).fillna(0)
     fq_data['consumo_medio'] = np.where(fq_data['litros_totais'] > 0, fq_data['km_rodados'] / fq_data['litros_totais'], 0.0)
     
@@ -1201,14 +1201,13 @@ def generate_pdf_report(df_filtered, total_spend, total_liters, total_km, genera
     
     # 6. Driver Performance Summary
     story.append(Paragraph("<b>Performance e Custos por Motorista</b>", h1_style))
-    # Using df_filtered_copy created in Fortnightly Summary which has LITROS_SEM_ARLA
-    driver_summary = df_filtered_copy.groupby('NOME MOTORISTA').agg(
+    driver_summary = df_filtered.groupby('NOME MOTORISTA').agg(
         gasto_total=('VALOR EMISSAO', 'sum'),
-        litros_totais=('LITROS_SEM_ARLA', 'sum'),
+        litros_totais=('LITROS', 'sum'),
         abastecimentos=('VALOR EMISSAO', 'count')
     ).reset_index()
     
-    driver_km = df_filtered_copy[df_filtered_copy['TIPO COMBUSTIVEL'] == 'DIESEL S-10 COMUM'].groupby('NOME MOTORISTA')['KM RODADOS OU HORAS TRABALHADAS'].sum()
+    driver_km = df_filtered[df_filtered['TIPO COMBUSTIVEL'] == 'DIESEL S-10 COMUM'].groupby('NOME MOTORISTA')['KM RODADOS OU HORAS TRABALHADAS'].sum()
     driver_summary['km_rodados'] = driver_summary['NOME MOTORISTA'].map(driver_km).fillna(0)
     driver_summary['custo_km'] = np.where(driver_summary['km_rodados'] > 0, driver_summary['gasto_total'] / driver_summary['km_rodados'], 0.0)
     driver_summary['consumo_medio'] = np.where(driver_summary['litros_totais'] > 0, driver_summary['km_rodados'] / driver_summary['litros_totais'], 0.0)
