@@ -134,11 +134,32 @@ def get_fortnight_sort_key(name):
 # --- DATA LOADING ---
 @st.cache_data
 def load_and_clean_data(file_path_or_buffer):
+    import unicodedata
+
+    def strip_accents_and_strip(text):
+        if not isinstance(text, str):
+            return text
+        text = text.strip()
+        text = ''.join(c for c in unicodedata.normalize('NFD', text) if unicodedata.category(c) != 'Mn')
+        return text.upper()
+
     try:
-        df = pd.read_csv(file_path_or_buffer, sep=';')
+        # Detect delimiter dynamically
+        if isinstance(file_path_or_buffer, str):
+            with open(file_path_or_buffer, 'r', encoding='utf-8', errors='ignore') as f:
+                first_line = f.readline()
+        else:
+            first_line = file_path_or_buffer.getvalue().decode('utf-8', errors='ignore').split('\n')[0]
+            file_path_or_buffer.seek(0)
+        
+        separator = ';' if ';' in first_line else ','
+        df = pd.read_csv(file_path_or_buffer, sep=separator)
     except Exception as e:
         st.error(f"Erro ao ler o arquivo: {e}")
         return None
+
+    # Clean and standardise column names (stripping accents and spaces)
+    df.columns = [strip_accents_and_strip(c) for c in df.columns]
 
     # Helper to clean currency and numeric strings
     def clean_numeric(val):
@@ -160,14 +181,16 @@ def load_and_clean_data(file_path_or_buffer):
         if col in df.columns:
             df[col] = df[col].apply(clean_numeric)
             
-    # Clean up dates
+    # Clean up dates dynamically (handles mixed formats, with/without seconds)
     if 'DATA TRANSACAO' in df.columns:
-        df['DATA TRANSACAO'] = pd.to_datetime(df['DATA TRANSACAO'], format='%d/%m/%Y %H:%M:%S', errors='coerce')
+        df['DATA TRANSACAO'] = pd.to_datetime(df['DATA TRANSACAO'], format='mixed', dayfirst=True, errors='coerce')
         df['DATA'] = df['DATA TRANSACAO'].dt.date
         
     # Standardize names
-    df['NOME MOTORISTA'] = df['NOME MOTORISTA'].str.title()
-    df['NOME ESTABELECIMENTO'] = df['NOME ESTABELECIMENTO'].str.title()
+    if 'NOME MOTORISTA' in df.columns:
+        df['NOME MOTORISTA'] = df['NOME MOTORISTA'].str.title()
+    if 'NOME ESTABELECIMENTO' in df.columns:
+        df['NOME ESTABELECIMENTO'] = df['NOME ESTABELECIMENTO'].str.title()
     
     # Fortnight (Quinzena) Definition
     def get_fortnight(row):
@@ -187,7 +210,12 @@ def load_and_clean_data(file_path_or_buffer):
         return f"{half} {m_name}/{year_short}"
 
     df['QUINZENA'] = df.apply(get_fortnight, axis=1)
-    df['CATEGORIA'] = df['MODELO VEICULO'].map({'MASTER': 'Master', 'EXPRESS': 'Delivery'}).fillna('Outros')
+    
+    if 'MODELO VEICULO' in df.columns:
+        df['CATEGORIA'] = df['MODELO VEICULO'].map({'MASTER': 'Master', 'EXPRESS': 'Delivery'}).fillna('Outros')
+    else:
+        df['CATEGORIA'] = 'Outros'
+        
     df['CUSTO_KM'] = np.where(df['KM RODADOS OU HORAS TRABALHADAS'] > 0, df['VALOR EMISSAO'] / df['KM RODADOS OU HORAS TRABALHADAS'], 0.0)
     
     return df
@@ -439,81 +467,92 @@ all_quinzenas = sorted(df_global['QUINZENA'].unique(), key=get_fortnight_sort_ke
 with tab_oper:
     st.subheader("📊 Relatório de Custos e Consumo Quinzenal")
     
-    # Aggregation by fortnight
-    fq_summary = df_global.groupby('QUINZENA')[['VALOR EMISSAO', 'LITROS']].sum().reindex(all_quinzenas).reset_index()
+    # Aggregation of Spend, Liters and Diesel-Only Displacement (KM) by fortnight
+    df_diesel_only = df_global[df_global['TIPO COMBUSTIVEL'] == 'DIESEL S-10 COMUM']
+    diesel_fq_km = df_diesel_only.groupby('QUINZENA')['KM RODADOS OU HORAS TRABALHADAS'].sum()
     
-    # Calculate displacement (KM) from DIESEL S-10 COMUM
-    diesel_df = df_global[df_global['TIPO COMBUSTIVEL'] == 'DIESEL S-10 COMUM']
-    fq_km = diesel_df.groupby('QUINZENA')['KM RODADOS OU HORAS TRABALHADAS'].sum().reindex(all_quinzenas).fillna(0).reset_index()
-    fq_summary['KM_RODADOS'] = fq_km['KM RODADOS OU HORAS TRABALHADAS']
+    fq_summary = df_global.groupby('QUINZENA').agg(
+        gasto_total=('VALOR EMISSAO', 'sum'),
+        litros_totais=('LITROS', 'sum')
+    ).reindex(all_quinzenas).reset_index()
     
-    # Calculate dynamic colors and positions for Deslocamento (km) to prevent overlap
-    # and to ensure readability inside dark green bars.
-    km_colors = []
-    km_positions = []
-    for idx, row in fq_summary.iterrows():
-        spend = row['VALOR EMISSAO']
-        km = row['KM_RODADOS']
-        if km < spend:
-            # Sits inside the dark green bar, make it white and place at bottom center to stay well inside the bar
-            km_colors.append("white")
-            km_positions.append("bottom center")
-        else:
-            # Sits above the bar on a white background, make it dark slate
-            km_colors.append("#1e293b")
-            km_positions.append("top center")
-            
-    # Plotly Multi Y-Axis Chart (Bar for Spend, Line for KM, Line for Liters)
+    fq_summary['km_totais'] = fq_summary['QUINZENA'].map(diesel_fq_km).fillna(0.0)
+    
+    # Plotly Triple Y-Axis Chart (Bar for Spend, Line for Liters, Line for KM)
     fig_fq_dual = go.Figure()
     
-    # 1. Bar for Spend (Valor Gasto R$) - Primary Y-Axis (y1)
+    # 1. Bar for spend (yaxis1 - left)
     fig_fq_dual.add_trace(go.Bar(
         x=fq_summary['QUINZENA'],
-        y=fq_summary['VALOR EMISSAO'],
+        y=fq_summary['gasto_total'],
         name="Valor Gasto (R$)",
         marker_color="#009a53", # Verde Anjun
-        text=fq_summary['VALOR EMISSAO'].apply(lambda x: format_pt_br(x, 2, True)),
-        textposition="inside", # Forces label inside the bar
-        textfont=dict(color="white", size=11, family="Inter"), # Ensures text inside the dark bar is white!
+        text=fq_summary['gasto_total'].apply(lambda x: format_pt_br(x, 2, True)),
+        textposition="inside", # Rótulo de dados dentro da barra para contraste escuro
+        insidetextfont=dict(color="white", size=11, family="Inter"), # Letra branca sobre fundo verde escuro
         yaxis="y1"
     ))
     
-    # 2. Line for Displacement (Deslocamento km) - Primary Y-Axis (y1)
+    # 2. Line for liters (yaxis2 - right)
     fig_fq_dual.add_trace(go.Scatter(
         x=fq_summary['QUINZENA'],
-        y=fq_summary['KM_RODADOS'],
-        name="Deslocamento (km)",
-        mode="lines+markers+text",
-        line=dict(color="#f7cd23", width=4), # Amarelo Ouro
-        marker=dict(size=10, color="#f7cd23", symbol="circle"),
-        text=fq_summary['KM_RODADOS'].apply(lambda x: format_pt_br(x, 0) + " km"),
-        textposition=km_positions, # Smart positioning to prevent overlap
-        textfont=dict(color=km_colors, size=11, family="Inter"), # Smart colors to ensure legibility inside bars
-        yaxis="y1"
-    ))
-    
-    # 3. Line for Volume Consumido (Liters L) - Secondary Y-Axis (y2)
-    fig_fq_dual.add_trace(go.Scatter(
-        x=fq_summary['QUINZENA'],
-        y=fq_summary['LITROS'],
+        y=fq_summary['litros_totais'],
         name="Volume Consumido (L)",
         mode="lines+markers+text",
         line=dict(color="#dc2626", width=4), # Vermelho Anjun
-        marker=dict(size=10, color="#dc2626", symbol="square"),
-        text=fq_summary['LITROS'].apply(lambda x: format_pt_br(x, 0) + " L"),
-        textposition="bottom center", # Offset to bottom center to prevent overlap with KM line labels at top center
+        marker=dict(size=10, color="#dc2626"),
+        text=fq_summary['litros_totais'].apply(lambda x: format_pt_br(x, 0) + " L"),
+        textposition="top center", # Rótulo acima do ponto para não sobrepor
         textfont=dict(color="#dc2626", size=11, family="Inter"),
         yaxis="y2"
     ))
     
+    # 3. Line for displacement (yaxis3 - right, shifted)
+    fig_fq_dual.add_trace(go.Scatter(
+        x=fq_summary['QUINZENA'],
+        y=fq_summary['km_totais'],
+        name="Deslocamento (km)",
+        mode="lines+markers+text",
+        line=dict(color="#f7cd23", width=4), # Amarelo Ouro ANJUN
+        marker=dict(size=10, color="#f7cd23"),
+        text=fq_summary['km_totais'].apply(lambda x: format_pt_br(x, 0) + " km"),
+        textposition="bottom center", # Rótulo posicionado abaixo do ponto para não sobrepor
+        textfont=dict(color="#b45309", size=11, family="Inter"), # Tom escuro legível sobre fundo claro
+        yaxis="y3"
+    ))
+    
     fig_fq_dual.update_layout(
-        title=dict(text="Custos, Deslocamentos e Volumes por Quinzena", font=dict(size=15, color="#1e293b", family="Inter")),
+        title=dict(text="Custos, Volumes e Deslocamento por Quinzena", font=dict(size=15, color="#1e293b", family="Inter")),
         xaxis=dict(title="Quinzena"),
-        yaxis=dict(title=dict(text="Valor Gasto (R$) e Deslocamento (km)", font=dict(color="#009a53")), tickfont=dict(color="#009a53"), tickprefix=""),
-        yaxis2=dict(title=dict(text="Volume (Litros)", font=dict(color="#dc2626")), tickfont=dict(color="#dc2626"), overlaying="y", side="right"),
-        legend=dict(x=0.01, y=0.99, bgcolor="rgba(255, 255, 255, 0.8)"),
-        margin=dict(l=40, r=40, t=50, b=40),
-        height=450,
+        yaxis=dict(
+            title=dict(text="Valor Gasto (R$)", font=dict(color="#009a53")),
+            tickfont=dict(color="#009a53"),
+            tickprefix="R$ "
+        ),
+        yaxis2=dict(
+            title=dict(text="Volume (Litros)", font=dict(color="#dc2626")),
+            tickfont=dict(color="#dc2626"),
+            overlaying="y",
+            side="right"
+        ),
+        yaxis3=dict(
+            title=dict(text="Deslocamento (km)", font=dict(color="#b45309")),
+            tickfont=dict(color="#b45309"),
+            overlaying="y",
+            side="right",
+            anchor="free",
+            position=1.12 # Posicionamento limpo à direita do eixo de volume
+        ),
+        legend=dict(
+            orientation="h",
+            yanchor="bottom",
+            y=1.02,
+            xanchor="right",
+            x=1,
+            bgcolor="rgba(255, 255, 255, 0.8)"
+        ),
+        margin=dict(l=60, r=80, t=80, b=40), # Margens limpas para abrigar o terceiro eixo
+        height=480,
         plot_bgcolor="#ffffff",
         paper_bgcolor="#ffffff"
     )
